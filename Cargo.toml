@@ -1,0 +1,21 @@
+[package]
+name = "system_monitor"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "system_monitor"
+path = "src/main.rs"
+
+[[bin]]
+name = "menubar"
+path = "src/bin/menubar.rs"
+
+[dependencies]
+block2 = "0.6.2"
+objc2 = { version = "0.6.4", features = ["exception"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSButton", "NSApplication", "NSResponder", "NSControl", "NSCell", "NSRunningApplication", "NSWindow", "NSTextView", "NSTextField", "NSScrollView", "NSFont", "NSTextStorage", "NSTextContainer", "NSLayoutManager", "NSColor", "NSView", "NSGraphicsContext", "NSBezierPath", "NSStringDrawing", "objc2-core-foundation", "NSTabView", "NSTabViewItem", "NSTableView", "NSTableColumn", "NSTableRowView", "NSTableCellView", "NSUserInterfaceItemIdentification", "NSOutlineView", "NSImageView", "NSImage", "NSAlert", "block2"] }
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry", "NSURL", "NSValue"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sysinfo = "0.38.4"
