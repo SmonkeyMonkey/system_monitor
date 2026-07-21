@@ -43,7 +43,7 @@ pub fn top_memory_consumers(sys: &System, limit: usize) -> Vec<MemoryConsumer> {
         .filter(|p| p.memory_bytes > 0)
         .collect();
 
-    processes.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+    processes.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
     processes.truncate(limit);
     processes
 }
@@ -208,7 +208,7 @@ pub fn grouped_memory_consumers(sys: &System) -> Vec<MemoryProcessGroup> {
     let mut result: Vec<MemoryProcessGroup> = groups
         .into_iter()
         .map(|(app_name, mut children)| {
-            children.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+            children.sort_by_key(|c| std::cmp::Reverse(c.memory_bytes));
             let total_memory_bytes = children.iter().map(|c| c.memory_bytes).sum();
             let app_bundle_path = bundle_paths.remove(&app_name);
             MemoryProcessGroup {
@@ -220,7 +220,7 @@ pub fn grouped_memory_consumers(sys: &System) -> Vec<MemoryProcessGroup> {
         })
         .collect();
 
-    result.sort_by(|a, b| b.total_memory_bytes.cmp(&a.total_memory_bytes));
+    result.sort_by_key(|r| std::cmp::Reverse(r.total_memory_bytes));
     result
 }
 

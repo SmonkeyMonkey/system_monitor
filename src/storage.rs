@@ -77,7 +77,7 @@ pub fn scan_largest_entries(root: &Path, on_progress: impl Fn(ScanProgress)) -> 
     };
 
     let mut entries = scan_dir(root, &mut visited, &mut report);
-    entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
     entries
 }
 
@@ -128,7 +128,7 @@ pub fn find_build_caches(entries: &[Entry]) -> Vec<CacheEntry> {
     for entry in entries {
         collect_caches(entry, &mut results);
     }
-    results.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    results.sort_by_key(|r| std::cmp::Reverse(r.size_bytes));
     results
 }
 
@@ -179,7 +179,7 @@ fn scan_dir(dir: &Path, visited: &mut u64, report: &mut impl FnMut(u64)) -> Vec<
 
         if metadata.is_dir() {
             let mut children = scan_dir(&path, visited, report);
-            children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            children.sort_by_key(|c| std::cmp::Reverse(c.size_bytes));
             let size_bytes = children.iter().map(|c| c.size_bytes).sum();
             entries.push(Entry {
                 path,
