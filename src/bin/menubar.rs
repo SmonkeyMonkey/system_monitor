@@ -8,17 +8,25 @@
 mod caches_table;
 #[path = "menubar_support/collector_worker.rs"]
 mod collector_worker;
+#[path = "menubar_support/network_table.rs"]
+mod network_table;
+#[path = "menubar_support/network_traffic_worker.rs"]
+mod network_traffic_worker;
 #[path = "menubar_support/process_outline.rs"]
 mod process_outline;
 #[path = "menubar_support/process_rusage.rs"]
 mod process_rusage;
 #[path = "menubar_support/ring_view.rs"]
 mod ring_view;
+#[path = "menubar_support/sparkline_view.rs"]
+mod sparkline_view;
 #[path = "menubar_support/storage_outline.rs"]
 mod storage_outline;
 
 use caches_table::CachesTableDataSource;
 use collector_worker::CollectorWorker;
+use network_table::NetworkTableDataSource;
+use network_traffic_worker::NetworkTrafficWorker;
 use objc2::rc::Retained;
 use objc2::{MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
@@ -33,6 +41,7 @@ use objc2_foundation::{
 };
 use process_outline::ProcessOutlineDataSource;
 use ring_view::RingView;
+use sparkline_view::SparklineView;
 use std::cell::RefCell;
 use storage_outline::StorageOutlineDataSource;
 
@@ -67,6 +76,18 @@ struct StorageWindowWidgets {
     caches_summary_label: Retained<NSTextField>,
 }
 
+struct NetworkWindowWidgets {
+    network_table: Retained<NSTableView>,
+    network_data_source: Retained<NetworkTableDataSource>,
+    status_label: Retained<NSTextField>,
+    status_primary_label: Retained<NSTextField>,
+    packet_loss_sparkline: Retained<SparklineView>,
+    download_sparkline: Retained<SparklineView>,
+    download_value_label: Retained<NSTextField>,
+    upload_sparkline: Retained<SparklineView>,
+    upload_value_label: Retained<NSTextField>,
+}
+
 struct State {
     worker: CollectorWorker,
     // The most recently received snapshot, kept around so callers that
@@ -74,6 +95,28 @@ struct State {
     // something to render even before a freshly requested one arrives —
     // it's only ever a poll interval or two stale.
     latest_snapshot: Option<system_monitor::Snapshot>,
+    // received()/transmitted()/errors_on_*() are deltas since the last
+    // refresh, so this has to be the same `Networks` instance across every
+    // Network window tick rather than a fresh one each time (which would
+    // always read zero). Lives on the main thread alongside the rest of
+    // State since the Network window's refresh timer already runs there.
+    networks: sysinfo::Networks,
+    // sysinfo::Networks sums every process's traffic on an interface,
+    // which is correct but easy to misread as "what this one app is
+    // doing" when something unrelated (a big background upload, a sync
+    // job) happens to dominate the same tick. network_traffic_worker
+    // reaches the same system-wide total through nettop's per-process
+    // breakdown instead, summed back up — not per-process attribution,
+    // just a second path to the same total that's easier to reason about
+    // and cross-check. nettop takes ~5s per call, so it runs on its own
+    // background worker rather than the Speed tab's 2s timer.
+    network_traffic_worker: NetworkTrafficWorker,
+    // The most recent cumulative totals nettop reported, and when — both
+    // needed to turn the next reading into a (bytes-since-then / real
+    // elapsed time) rate, the same reasoning as sysinfo's per-tick deltas
+    // above but on nettop's own (slower, ~5-10s) cadence.
+    last_system_traffic: Option<system_monitor::network::SystemTraffic>,
+    last_system_traffic_at: Option<std::time::Instant>,
 }
 
 define_class!(
@@ -92,6 +135,16 @@ define_class!(
         #[unsafe(method(pollSnapshot:))]
         fn poll_snapshot(&self, _timer: &objc2_foundation::NSTimer) {
             poll_snapshot();
+        }
+
+        #[unsafe(method(requestNetworkTraffic:))]
+        fn request_network_traffic(&self, _timer: &objc2_foundation::NSTimer) {
+            request_network_traffic();
+        }
+
+        #[unsafe(method(pollNetworkTraffic:))]
+        fn poll_network_traffic(&self, _timer: &objc2_foundation::NSTimer) {
+            poll_network_traffic();
         }
 
         #[unsafe(method(showInfoWindow:))]
@@ -134,6 +187,16 @@ define_class!(
             refresh_storage_window();
         }
 
+        #[unsafe(method(showNetworkWindow:))]
+        fn show_network_window(&self, _sender: &objc2::runtime::AnyObject) {
+            show_network_window();
+        }
+
+        #[unsafe(method(refreshNetworkWindow:))]
+        fn refresh_network_window(&self, _timer: &objc2_foundation::NSTimer) {
+            refresh_network_window();
+        }
+
         #[unsafe(method(showInFinder:))]
         fn show_in_finder(&self, _sender: &objc2::runtime::AnyObject) {
             show_selected_entry_in_finder();
@@ -163,6 +226,12 @@ impl AppTarget {
     }
 }
 
+// How often the Network window's timer re-collects interface stats.
+// download_bytes_per_tick/upload_bytes_per_tick are deltas over exactly
+// this interval, so displaying them as a rate divides by this same
+// constant rather than a second hardcoded copy of the timer's interval.
+const NETWORK_REFRESH_INTERVAL_SECS: f64 = 2.0;
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static BUTTON: RefCell<Option<Retained<NSStatusBarButton>>> = const { RefCell::new(None) };
@@ -176,6 +245,11 @@ thread_local! {
     static STORAGE_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
     static STORAGE_WIDGETS: RefCell<Option<StorageWindowWidgets>> = const { RefCell::new(None) };
     static STORAGE_REFRESH_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
+    static NETWORK_WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+    static NETWORK_WIDGETS: RefCell<Option<NetworkWindowWidgets>> = const { RefCell::new(None) };
+    static NETWORK_REFRESH_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
+    static NETWORK_TRAFFIC_REQUEST_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
+    static NETWORK_TRAFFIC_POLL_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
     // Holds the most recent scan's detected caches so the Caches tab has
     // something to show even if it's opened/rebuilt after the scan
     // finished (the window itself is rebuilt each time it's opened, but
@@ -343,6 +417,18 @@ fn build_menu(snapshot: &system_monitor::Snapshot, mtm: MainThreadMarker) -> Ret
         }
     });
     menu.addItem(&storage_item);
+
+    let network_item = NSMenuItem::new(mtm);
+    network_item.setTitle(ns_string!("Network Info\u{2026}"));
+    APP_TARGET.with(|target| {
+        if let Some(target) = target.borrow().as_ref() {
+            unsafe {
+                network_item.setTarget(Some(target));
+                network_item.setAction(Some(sel!(showNetworkWindow:)));
+            }
+        }
+    });
+    menu.addItem(&network_item);
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let quit_item = NSMenuItem::new(mtm);
@@ -741,6 +827,165 @@ fn refresh_storage_window() {
                 .setStringValue(&NSString::from_str(&disk_summary_text));
         }
     });
+}
+
+fn refresh_network_window() {
+    let window_closed = NETWORK_WINDOW.with(|w| match w.borrow().as_ref() {
+        Some(window) => !window.isVisible(),
+        None => true,
+    });
+    if window_closed {
+        NETWORK_REFRESH_TIMER.with(|t| {
+            if let Some(timer) = t.borrow_mut().take() {
+                timer.invalidate();
+            }
+        });
+        NETWORK_TRAFFIC_REQUEST_TIMER.with(|t| {
+            if let Some(timer) = t.borrow_mut().take() {
+                timer.invalidate();
+            }
+        });
+        NETWORK_TRAFFIC_POLL_TIMER.with(|t| {
+            if let Some(timer) = t.borrow_mut().take() {
+                timer.invalidate();
+            }
+        });
+        NETWORK_WIDGETS.with(|w| *w.borrow_mut() = None);
+        NETWORK_WINDOW.with(|w| *w.borrow_mut() = None);
+        return;
+    }
+
+    let interfaces = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return Vec::new();
+        };
+        system_monitor::network::collect_interfaces(&mut state.networks)
+    });
+
+    let primary = system_monitor::network::select_primary(&interfaces).cloned();
+
+    NETWORK_WIDGETS.with(|widgets| {
+        if let Some(w) = widgets.borrow().as_ref() {
+            w.network_data_source.set_rows(interfaces);
+            w.network_table.reloadData();
+
+            match &primary {
+                Some(iface) => {
+                    let stability =
+                        system_monitor::network::classify_stability(iface.packet_errors);
+                    w.status_label
+                        .setStringValue(&NSString::from_str(stability.label()));
+                    w.status_label.setTextColor(Some(&status_color(stability)));
+                    w.status_primary_label
+                        .setStringValue(&NSString::from_str(&format!(
+                            "Primary interface: {}",
+                            iface.display_name
+                        )));
+                    w.packet_loss_sparkline
+                        .push_sample(iface.packet_errors as f32);
+                }
+                None => {
+                    w.status_label.setStringValue(ns_string!("No Activity"));
+                    w.status_label
+                        .setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+                    w.status_primary_label
+                        .setStringValue(ns_string!("Primary interface: none"));
+                }
+            }
+        }
+    });
+}
+
+// Fire-and-forget: asks NetworkTrafficWorker's background thread for a
+// fresh nettop reading. Never blocks — nettop takes ~5s, so the result
+// shows up later via `poll_network_traffic`.
+fn request_network_traffic() {
+    STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.network_traffic_worker.request_traffic();
+        }
+    });
+}
+
+// Runs on a short-interval main-thread timer, same pattern as
+// poll_snapshot. Cheap no-op until the worker's ~5s nettop call finishes;
+// when it does, turns the new cumulative totals into a rate against the
+// previous reading and feeds the Speed tab's sparklines/labels.
+fn poll_network_traffic() {
+    let window_open = NETWORK_WINDOW.with(|w| w.borrow().as_ref().is_some_and(|w| w.isVisible()));
+    if !window_open {
+        return;
+    }
+
+    let update = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut()?;
+        let traffic = state.network_traffic_worker.try_recv_traffic()?;
+        let now = std::time::Instant::now();
+        let update = match (state.last_system_traffic, state.last_system_traffic_at) {
+            (Some(last), Some(last_at)) => Some((
+                traffic.total_bytes_in.saturating_sub(last.total_bytes_in),
+                traffic.total_bytes_out.saturating_sub(last.total_bytes_out),
+                now.duration_since(last_at).as_secs_f64(),
+            )),
+            // First reading since the window opened: nothing to diff
+            // against yet.
+            _ => None,
+        };
+        state.last_system_traffic = Some(traffic);
+        state.last_system_traffic_at = Some(now);
+        Some(update)
+    });
+
+    let Some(Some((bytes_in, bytes_out, elapsed_secs))) = update else {
+        return;
+    };
+    // A near-zero elapsed time (shouldn't happen given nettop's own ~5s
+    // floor, but guards div-by-zero if it ever did) would blow up the
+    // rate into nonsense rather than just reading low.
+    if elapsed_secs < 0.001 {
+        return;
+    }
+
+    NETWORK_WIDGETS.with(|widgets| {
+        if let Some(w) = widgets.borrow().as_ref() {
+            w.download_sparkline
+                .push_sample((bytes_in as f64 / elapsed_secs) as f32);
+            w.upload_sparkline
+                .push_sample((bytes_out as f64 / elapsed_secs) as f32);
+            w.download_value_label
+                .setStringValue(&NSString::from_str(&format!(
+                    "Download: {}",
+                    format_bytes_per_sec(bytes_in, elapsed_secs)
+                )));
+            w.upload_value_label
+                .setStringValue(&NSString::from_str(&format!(
+                    "Upload: {}",
+                    format_bytes_per_sec(bytes_out, elapsed_secs)
+                )));
+        }
+    });
+}
+
+fn status_color(stability: system_monitor::network::Stability) -> Retained<objc2_app_kit::NSColor> {
+    match stability {
+        system_monitor::network::Stability::Stable => objc2_app_kit::NSColor::systemGreenColor(),
+        system_monitor::network::Stability::Unstable => objc2_app_kit::NSColor::systemRedColor(),
+    }
+}
+
+fn format_bytes_per_sec(bytes_since_last_refresh: u64, elapsed_secs: f64) -> String {
+    let bytes_per_sec = bytes_since_last_refresh as f64 / elapsed_secs;
+    const MB: f64 = 1_048_576.0;
+    const KB: f64 = 1_024.0;
+    if bytes_per_sec >= MB {
+        format!("{:.2} MB/s", bytes_per_sec / MB)
+    } else if bytes_per_sec >= KB {
+        format!("{:.1} KB/s", bytes_per_sec / KB)
+    } else {
+        format!("{bytes_per_sec:.0} B/s")
+    }
 }
 
 // `position` picks which autoresizing margins keep the widget anchored as
@@ -1375,6 +1620,233 @@ fn build_caches_tab(
     (view, summary_label, table, data_source)
 }
 
+// Shared by both Network tabs: a sparkline with a title above it and
+// (optionally) a value label below, laid out as a fixed-height block
+// anchored to `top_y` and pinned to the top of the tab as the window
+// resizes (ViewMinYMargin — see the note on RingPosition's Y-axis
+// direction above; the same inversion applies here).
+fn build_labeled_sparkline(
+    mtm: MainThreadMarker,
+    content_view: &NSView,
+    window_width: f64,
+    top_y: f64,
+    height: f64,
+    title: &str,
+) -> (Retained<SparklineView>, Retained<NSTextField>) {
+    use objc2_app_kit::NSAutoresizingMaskOptions as Mask;
+
+    let title_rect = NSRect::new(
+        NSPoint::new(16.0, top_y - 18.0),
+        NSSize::new(window_width - 32.0, 18.0),
+    );
+    let title_label = NSTextField::alloc(mtm);
+    let title_label = NSTextField::initWithFrame(title_label, title_rect);
+    title_label.setEditable(false);
+    title_label.setBezeled(false);
+    title_label.setDrawsBackground(false);
+    title_label.setSelectable(false);
+    title_label.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+    // Starts as just "Download"/"Upload"; refresh_network_window appends
+    // the live rate to this same label each tick ("Download: 9 KB/tick")
+    // rather than repeating the word on a separate line underneath.
+    title_label.setStringValue(&NSString::from_str(title));
+    // ViewMinYMargin pins to the TOP in AppKit (Y grows upward, so the
+    // margin left flexible is the space *below* the view, at low Y) — see
+    // the same note on build_ring_widget above. Without it, AppKit's
+    // default keeps the *bottom* margin fixed instead, dragging this whole
+    // block down as the window grows, which is what actually caused the
+    // "stuck to the bottom" look.
+    title_label.setAutoresizingMask(Mask::ViewWidthSizable | Mask::ViewMinYMargin);
+    content_view.addSubview(&title_label);
+
+    let sparkline_rect = NSRect::new(
+        NSPoint::new(16.0, top_y - 18.0 - height),
+        NSSize::new(window_width - 32.0, height),
+    );
+    let sparkline = SparklineView::new(mtm, sparkline_rect);
+    sparkline.setAutoresizingMask(Mask::ViewWidthSizable | Mask::ViewMinYMargin);
+    content_view.addSubview(&sparkline);
+
+    (sparkline, title_label)
+}
+
+// Status tab: a big color-coded Stable/Unstable label (the primary
+// at-a-glance signal, mirroring the temperature hot/not-hot flag style),
+// a packet-error sparkline as a supporting trend visual, and a compact
+// table of every detected interface underneath for reference — this is
+// what used to be the whole window before the split; it stays, but is no
+// longer the star of the show.
+#[allow(clippy::type_complexity)]
+fn build_network_status_tab(
+    mtm: MainThreadMarker,
+    page_rect: NSRect,
+) -> (
+    Retained<NSView>,
+    Retained<NSTextField>,
+    Retained<NSTextField>,
+    Retained<SparklineView>,
+    Retained<NSTableView>,
+    Retained<NetworkTableDataSource>,
+) {
+    let view = NSView::initWithFrame(NSView::alloc(mtm), page_rect);
+    let window_width = page_rect.size.width;
+    let window_height = page_rect.size.height;
+
+    let status_rect = NSRect::new(
+        NSPoint::new(16.0, window_height - 40.0),
+        NSSize::new(window_width - 32.0, 32.0),
+    );
+    let status_label = NSTextField::alloc(mtm);
+    let status_label = NSTextField::initWithFrame(status_label, status_rect);
+    status_label.setEditable(false);
+    status_label.setBezeled(false);
+    status_label.setDrawsBackground(false);
+    status_label.setSelectable(false);
+    status_label.setFont(Some(&NSFont::boldSystemFontOfSize(22.0)));
+    status_label.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    view.addSubview(&status_label);
+
+    let primary_rect = NSRect::new(
+        NSPoint::new(16.0, window_height - 60.0),
+        NSSize::new(window_width - 32.0, 16.0),
+    );
+    let status_primary_label = NSTextField::alloc(mtm);
+    let status_primary_label = NSTextField::initWithFrame(status_primary_label, primary_rect);
+    status_primary_label.setEditable(false);
+    status_primary_label.setBezeled(false);
+    status_primary_label.setDrawsBackground(false);
+    status_primary_label.setSelectable(false);
+    status_primary_label.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+    status_primary_label.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    view.addSubview(&status_primary_label);
+
+    let (packet_loss_sparkline, _packet_loss_value_label) = build_labeled_sparkline(
+        mtm,
+        &view,
+        window_width,
+        window_height - 76.0,
+        60.0,
+        "Packet Errors (per tick, primary interface)",
+    );
+
+    let table_rect = NSRect::new(
+        NSPoint::new(16.0, 16.0),
+        NSSize::new(
+            window_width - 32.0,
+            window_height - 76.0 - 18.0 - 60.0 - 18.0 - 16.0,
+        ),
+    );
+    let scroll_view = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_rect);
+    scroll_view.setHasVerticalScroller(true);
+    scroll_view.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+    scroll_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), table_rect);
+
+    let interface_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("interface"));
+    interface_column.setTitle(ns_string!("Interface"));
+    interface_column.setWidth(table_rect.size.width * 0.18);
+    table.addTableColumn(&interface_column);
+
+    let download_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("download"));
+    download_column.setTitle(ns_string!("Download"));
+    download_column.setWidth(table_rect.size.width * 0.15);
+    table.addTableColumn(&download_column);
+
+    let upload_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("upload"));
+    upload_column.setTitle(ns_string!("Upload"));
+    upload_column.setWidth(table_rect.size.width * 0.15);
+    table.addTableColumn(&upload_column);
+
+    let status_column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("status"));
+    status_column.setTitle(ns_string!("Status"));
+    status_column.setWidth(table_rect.size.width * 0.12);
+    table.addTableColumn(&status_column);
+
+    let ip_column = NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("ip"));
+    ip_column.setTitle(ns_string!("IP Address(es)"));
+    ip_column.setWidth(table_rect.size.width * 0.40);
+    table.addTableColumn(&ip_column);
+
+    let data_source = NetworkTableDataSource::new(mtm);
+    unsafe {
+        table.setDataSource(Some(data_source.as_data_source()));
+        table.setDelegate(Some(data_source.as_delegate()));
+    };
+
+    scroll_view.setDocumentView(Some(&table));
+    view.addSubview(&scroll_view);
+
+    (
+        view,
+        status_label,
+        status_primary_label,
+        packet_loss_sparkline,
+        table,
+        data_source,
+    )
+}
+
+// Speed tab: download/upload throughput for the primary interface, each as
+// its own sparkline with a current-rate label — simpler than overlaying
+// both series on one chart, and avoids needing a legend.
+#[allow(clippy::type_complexity)]
+fn build_network_speed_tab(
+    mtm: MainThreadMarker,
+    page_rect: NSRect,
+) -> (
+    Retained<NSView>,
+    Retained<SparklineView>,
+    Retained<NSTextField>,
+    Retained<SparklineView>,
+    Retained<NSTextField>,
+) {
+    let view = NSView::initWithFrame(NSView::alloc(mtm), page_rect);
+    let window_width = page_rect.size.width;
+    let window_height = page_rect.size.height;
+
+    let chart_height = (window_height - 32.0 - 2.0 * (18.0 + 18.0)) / 2.0;
+
+    let (download_sparkline, download_value_label) = build_labeled_sparkline(
+        mtm,
+        &view,
+        window_width,
+        window_height - 16.0,
+        chart_height,
+        "Download",
+    );
+
+    let (upload_sparkline, upload_value_label) = build_labeled_sparkline(
+        mtm,
+        &view,
+        window_width,
+        window_height - 16.0 - 18.0 - chart_height - 18.0,
+        chart_height,
+        "Upload",
+    );
+
+    (
+        view,
+        download_sparkline,
+        download_value_label,
+        upload_sparkline,
+        upload_value_label,
+    )
+}
+
 fn show_info_window() {
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
 
@@ -1671,6 +2143,186 @@ fn show_storage_window() {
     });
 }
 
+fn show_network_window() {
+    let mtm = MainThreadMarker::new().expect("must run on the main thread");
+
+    let already_open = NETWORK_WINDOW.with(|w| w.borrow().is_some());
+    if already_open {
+        // The window object survives being hidden, but closing it
+        // invalidates all its timers (see refresh_network_window's
+        // window_closed branch) — if this reopen followed a close, those
+        // timers need restarting or the Status/Speed tabs never update
+        // again. Checking the request timer specifically is enough since
+        // start_network_traffic_polling always (re)starts all of them
+        // together.
+        let timers_running = NETWORK_TRAFFIC_REQUEST_TIMER.with(|t| t.borrow().is_some());
+        if !timers_running {
+            start_network_traffic_polling();
+        } else {
+            refresh_network_window();
+        }
+        NETWORK_WINDOW.with(|w| {
+            if let Some(window) = w.borrow().as_ref() {
+                NSApplication::sharedApplication(mtm).activate();
+                window.orderFrontRegardless();
+                window.makeKeyWindow();
+            }
+        });
+        return;
+    }
+
+    let window_width = 640.0;
+    let window_height = 360.0;
+    let content_rect = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(window_width, window_height),
+    );
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            content_rect,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    window.setTitle(ns_string!("System Monitor \u{2014} Network"));
+    window.setMinSize(NSSize::new(window_width, window_height));
+    window.center();
+    unsafe { window.setReleasedWhenClosed(false) };
+
+    let tab_view = NSTabView::initWithFrame(NSTabView::alloc(mtm), content_rect);
+    tab_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    // Set the tab view as the window's content first, then read back its
+    // actual contentRect() — see the matching comment in show_info_window
+    // and show_storage_window for why guessing this rect breaks
+    // bottom-anchored elements.
+    window.setContentView(Some(&tab_view));
+    let page_rect = tab_view.contentRect();
+
+    let (
+        status_view,
+        status_label,
+        status_primary_label,
+        packet_loss_sparkline,
+        network_table,
+        network_data_source,
+    ) = build_network_status_tab(mtm, page_rect);
+    status_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    let status_item = NSTabViewItem::new();
+    status_item.setLabel(ns_string!("Status"));
+    status_item.setView(Some(&status_view));
+    tab_view.addTabViewItem(&status_item);
+
+    let (
+        speed_view,
+        download_sparkline,
+        download_value_label,
+        upload_sparkline,
+        upload_value_label,
+    ) = build_network_speed_tab(mtm, page_rect);
+    speed_view.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    let speed_item = NSTabViewItem::new();
+    speed_item.setLabel(ns_string!("Speed"));
+    speed_item.setView(Some(&speed_view));
+    tab_view.addTabViewItem(&speed_item);
+
+    NSApplication::sharedApplication(mtm).activate();
+    window.orderFrontRegardless();
+    window.makeKeyWindow();
+
+    NETWORK_WINDOW.with(|w| *w.borrow_mut() = Some(window));
+    NETWORK_WIDGETS.with(|w| {
+        *w.borrow_mut() = Some(NetworkWindowWidgets {
+            network_table,
+            network_data_source,
+            status_label,
+            status_primary_label,
+            packet_loss_sparkline,
+            download_sparkline,
+            download_value_label,
+            upload_sparkline,
+            upload_value_label,
+        })
+    });
+
+    refresh_network_window();
+    start_network_traffic_polling();
+}
+
+// (Re)starts every timer the Network window depends on, plus resets the
+// nettop diff baseline. Called both when the window is first built and
+// when it's re-shown after having been closed — closing invalidates all
+// of these timers (see refresh_network_window's window_closed branch), so
+// simply reusing already-open's early return without this left both the
+// Status tab's periodic refresh and the Speed tab frozen at their initial
+// state on every reopen after the first.
+fn start_network_traffic_polling() {
+    STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            state.last_system_traffic = None;
+            state.last_system_traffic_at = None;
+        }
+    });
+
+    request_network_traffic();
+
+    APP_TARGET.with(|target| {
+        if let Some(target) = target.borrow().as_ref() {
+            let refresh_timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    NETWORK_REFRESH_INTERVAL_SECS,
+                    target,
+                    sel!(refreshNetworkWindow:),
+                    None,
+                    true,
+                )
+            };
+            NETWORK_REFRESH_TIMER.with(|t| *t.borrow_mut() = Some(refresh_timer));
+
+            // nettop takes ~5s per call regardless of sample count, so
+            // requests go out on a longer interval than the poll that
+            // picks up the result — mirrors requestSnapshot/pollSnapshot's
+            // relationship above.
+            let traffic_request_timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    7.0,
+                    target,
+                    sel!(requestNetworkTraffic:),
+                    None,
+                    true,
+                )
+            };
+            NETWORK_TRAFFIC_REQUEST_TIMER.with(|t| *t.borrow_mut() = Some(traffic_request_timer));
+
+            let traffic_poll_timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.5,
+                    target,
+                    sel!(pollNetworkTraffic:),
+                    None,
+                    true,
+                )
+            };
+            NETWORK_TRAFFIC_POLL_TIMER.with(|t| *t.borrow_mut() = Some(traffic_poll_timer));
+        }
+    });
+}
+
 fn main() {
     let mtm = MainThreadMarker::new().expect("menubar must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -1680,6 +2332,10 @@ fn main() {
         *state.borrow_mut() = Some(State {
             worker: CollectorWorker::spawn(),
             latest_snapshot: None,
+            networks: sysinfo::Networks::new_with_refreshed_list(),
+            network_traffic_worker: NetworkTrafficWorker::spawn(),
+            last_system_traffic: None,
+            last_system_traffic_at: None,
         });
     });
 

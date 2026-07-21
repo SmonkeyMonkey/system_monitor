@@ -4,6 +4,7 @@ pub mod baseline;
 pub mod cause;
 #[cfg(target_os = "macos")]
 pub mod launchd;
+pub mod network;
 pub mod reference;
 pub mod storage;
 
